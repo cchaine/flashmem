@@ -10,11 +10,24 @@ from rich.theme import Theme
 
 SECTOR_SIZE = 0x10000
 
+WRITE_ENABLE = 0x06
+WRITE_DISABLE = 0x04
+READ_IDENTIFICATION = 0x9F
+READ_STATUS_REGISTER = 0x05
+WRITE_STATUS_REGISTER = 0x01
+READ_DATA_BYTES = 0x03
+READ_DATA_BYTES_FAST = 0x0B
+PAGE_PROGRAM = 0x02
+SECTOR_ERASE = 0xD8
+BULK_ERASE = 0xC7
+DEEP_POWER_DOWN = 0xB9
+RELEASE_FROM_DEEP_POWER_DOWN = 0xAB
+
 def get_status():
-    return slave.exchange([0x9F], 1)
+    return slave.exchange([READ_STATUS_REGISTER], 1)[0]
 
 def wait_done():
-    while (get_status()[0] == 0) or (get_status()[0] & 0x1) == 1:
+    while (get_status() & 0x1) == 1:
         continue
 
 if __name__ == "__main__":
@@ -49,43 +62,39 @@ if __name__ == "__main__":
     try:
         spi = SpiController()
         spi.configure("ftdi://ftdi:232h/0")
-        slave = spi.get_port(cs=0, freq=1e6, mode=3)
+        slave = spi.get_port(cs=0, freq=10e6, mode=3)
     except pyftdi.usbtools.UsbToolsError:
         console.print("Failed to communicate with the FT232H chip", style="red")
         exit(1)
 
-    jedec_id = slave.exchange([0x9F], 2)
+    jedec_id = slave.exchange([READ_IDENTIFICATION], 2)
     if int.from_bytes(jedec_id, byteorder='big', signed=False) != 0x2020:
         console.print("Failed to detect M25P16 Flash memory", style="red");
         exit(1)
 
     # Write enable
-    slave.exchange([0x06])
+    slave.exchange([WRITE_ENABLE])
 
     # Check if write enable worked
-    read_status = slave.exchange([0x05], 1)
-    if read_status[0] & 0x2 == 0:
+    read_status = get_status()
+    if read_status & 0x2 == 0:
         console.print("Failed to enable write", style="red")
         exit(1)
 
     # Disable block protect
-    if read_status[0] & 0x1C != 0:
-        slave.exchange([0x01, read_status[0] & 0xE3]);
+    if read_status & 0x1C != 0:
+        slave.exchange([WRITE_STATUS_REGISTER, read_status & 0xE3]);
 
     # Erase
-    with Progress(
-        SpinnerColumn(spinner_name="point", style="white"),
-        TextColumn("[white]{task.fields[name]}", justify="right"),
-        BarColumn()
-    ) as progress:
+    with console.status("Erasing...") as status:
         num_sectors = ceil(len(conf_bin) / float(SECTOR_SIZE))
         sectors = [i * SECTOR_SIZE for i in range(num_sectors)]
-        erase_progress = progress.add_task("erase", name="Erasing...", total=num_sectors)
 
         for sector in sectors:
             wait_done()
-            slave.exchange([0xD8, (sector >> 16) & 0xFF, (sector >> 8) & 0xFF, sector & 0xFF])
-            progress.update(erase_progress, advance=1)
+            slave.exchange([SECTOR_ERASE, (sector >> 16) & 0xFF, (sector >> 8) & 0xFF, sector & 0xFF])
+        
+        status.stop()
 
     with Progress(
         SpinnerColumn(spinner_name="point", style="white"),
@@ -108,7 +117,8 @@ if __name__ == "__main__":
             # Check if the flash is ready
             wait_done()
             
-            page_write = [0x02]
+            slave.exchange([WRITE_ENABLE])
+            page_write = [PAGE_PROGRAM]
             page_write += [(address >> 16) & 0xFF, (address >> 8) & 0xFF, address & 0xFF]
             page_write += page
             slave.exchange(page_write)
@@ -116,14 +126,14 @@ if __name__ == "__main__":
             progress.update(flash_progress, advance=len(page))
 
             # Increment address
-            address += 1
+            address += len(page)
 
         # Verify
         verify_progress = progress.add_task("verify", name="Verifying...", total=len(conf_bin))
         address = 0
         for page in pages:
             wait_done()
-            read_page = slave.exchange([0x0B, (address >> 16) & 0xFF, (address >> 8) & 0xFF, address & 0xFF], len(page))
+            read_page = slave.exchange([READ_DATA_BYTES, (address >> 16) & 0xFF, (address >> 8) & 0xFF, address & 0xFF], len(page))
             for i in range(len(page)):
                 if page[i] != read_page[i]:
                     console.print("Written page @ {} differs".format(address), style="red")
@@ -133,6 +143,7 @@ if __name__ == "__main__":
 
             progress.update(verify_progress, advance=len(page))
 
-            address += 1
+            address += len(page)
 
-    console.print("Flash successfull!", style="green")
+        progress.stop() 
+        console.print("\nFlash successfull!", style="green")
